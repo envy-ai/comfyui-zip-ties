@@ -258,6 +258,12 @@ function applyCut(canvas, graph, p, q) {
     return (a[0] - b[0]) * n[0] + (a[1] - b[1]) * n[1];
   });
 
+  // Keep the ribbon straight between ties: if an existing tie holds every new wire,
+  // reuse its strand order so the wires cross outside the bundle, not inside it.
+  const ids = hits.map((h) => h.link.id);
+  const twin = tiesOf(graph).find((t) => ids.every((id) => t.links.includes(id)));
+  if (twin) hits.sort((h1, h2) => twin.links.indexOf(h1.link.id) - twin.links.indexOf(h2.link.id));
+
   const all = tiesOf(graph, true);
   all.push({ id: nextTieId(all), pos, angle, links: hits.map((h) => h.link.id) });
   syncTies(graph);
