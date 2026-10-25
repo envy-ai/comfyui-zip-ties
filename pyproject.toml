@@ -1,0 +1,10 @@
+[project]
+name = "comfyui-zip-ties"
+description = "Bundle ComfyUI wires into ribbons with draggable zip ties."
+version = "0.1.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[tool.comfy]
+DisplayName = "Zip Ties"
+includes = ["web"]
