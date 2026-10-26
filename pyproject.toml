@@ -1,10 +1,16 @@
 [project]
 name = "comfyui-zip-ties"
-description = "Bundle ComfyUI wires into ribbons with draggable zip ties."
-version = "0.1.0"
+description = "Bundle ComfyUI wires into ribbons with colour-coded zip ties. Hold Z and drag across wires to tie them."
+version = "0.2.0"
 license = { file = "LICENSE" }
 dependencies = []
 
+[project.urls]
+Repository = "https://github.com/safzanpirani/comfyui-zip-ties"
+"Bug Tracker" = "https://github.com/safzanpirani/comfyui-zip-ties/issues"
+
 [tool.comfy]
+PublisherId = "safzanpirani"
 DisplayName = "Zip Ties"
+Icon = "https://raw.githubusercontent.com/safzanpirani/comfyui-zip-ties/main/icon.png"
 includes = ["web"]
