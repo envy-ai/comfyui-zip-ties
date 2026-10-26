@@ -3,8 +3,13 @@ import { app } from "../../scripts/app.js";
 // Zip ties: hold Z and drag across wires to bundle them into a ribbon.
 // Drag a tie to move it, Shift-drag to rotate it, right-click it for colours.
 // Z-drag across a tie, or double-click it, to cut it.
+//
+// A tie holds "members". A number is a link id: the whole link, or for a link that passes through
+// reroutes, its last segment (last reroute to input). A string "r<id>" is the segment that ends at
+// reroute <id>; reroute segments are shared by every link through that reroute.
 
 const EXTRA_KEY = "zipTies";
+const CLIPBOARD_KEY = "zipTies";
 const DIR = { NONE: 0, UP: 1, DOWN: 2, LEFT: 3, RIGHT: 4, CENTER: 5 };
 const MARKER_NONE = 0;
 const CONTROL_FACTOR = 0.25;
@@ -16,8 +21,11 @@ const HEAD_LENGTH = 6;
 const HIT_PAD_PX = 6;
 const DOUBLE_CLICK_MS = 350;
 const SNAP = Math.PI / 12; // 15°
+const HIDDEN_LINK = -1;
 
 const GREY = "#8c8c94";
+const CUT_RED = "#ff3b3b";
+const PREVIEW_WHITE = "#ffffff";
 const WIRES = "wires"; // tie.color value: take the colour of the wires it holds
 const PALETTE = [
   ["Red", "#e5484d"],
@@ -33,21 +41,28 @@ const PALETTE = [
 ];
 const COLOR_SETTING = "ZipTies.NewTieColor";
 const COLOR_MODE = { RANDOM: "Random", WIRES: "Match wires", GREY: "Grey" };
+const KEY_SETTING = "ZipTies.Key";
+// Letters ComfyUI does not bind on their own (it binds r w n m a p v h).
+const KEYS = ["Z", "X", "C", "G", "T", "Y"];
 
 const state = {
-  zHeld: false,
+  keyHeld: false,
+  armed: false, // "Tie wires" from the canvas menu: the next drag is a tie stroke
   pointerDown: false,
   hovered: null, // tie id
   drag: null, // { tie, dx, dy, pointerId, moved, rotate, offset }
-  cut: null, // { start, end, pointerId }
+  cut: null, // { start, client, pointerId, last }
+  preview: null, // { keys: Set, cutTies: Set } while a stroke is in progress
+  previewFrame: 0,
   lastDown: { id: null, time: 0 },
   rendering: false,
-  endpoints: new Map(), // link id -> { a, b, sd, ed } captured from the last frame
-  linkColors: new Map(), // link id -> colour the wire was drawn in last frame
-  index: new Map(), // link id -> ties[]
+  rendered: false, // set by renderLink, read by the culling fallback
+  endpoints: new Map(), // member key -> { a, b, sd, ed, startControl, endControl } from the last frame
+  linkColors: new Map(), // member key -> colour the wire was drawn in last frame
+  index: new Map(), // member key -> ties[]
   sigs: new Map(), // tied link id -> "origin:slot>target:slot", to follow a wire that is reconnected
-  nodePos: new Map(), // node id -> [x, y] last frame, for nodes on tied wires
-  nodePosFor: null, // the ties array nodePos was recorded against
+  anchorPos: new Map(), // anchor key -> [x, y] last frame, for nodes and reroutes on tied wires
+  anchorPosFor: null, // the ties array anchorPos was recorded against
   overlay: null,
 };
 
@@ -57,6 +72,15 @@ function setting(id, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function tieKeyCode() {
+  const key = setting(KEY_SETTING, "Z");
+  return `Key${KEYS.includes(key) ? key : "Z"}`;
+}
+
+function linksHidden(canvas) {
+  return canvas.links_render_mode === (window.LiteGraph?.HIDDEN_LINK ?? HIDDEN_LINK);
 }
 
 // ---------- data ----------
@@ -76,10 +100,30 @@ function getLink(graph, id) {
   return graph.getLink?.(id) ?? (graph.links instanceof Map ? graph.links.get(id) : graph.links?.[id]);
 }
 
+function getReroute(graph, id) {
+  return graph.getReroute?.(id) ?? graph.reroutes?.get?.(id);
+}
+
 function allLinks(graph) {
   const links = graph.links;
   if (!links) return [];
   return links instanceof Map ? [...links.values()] : Object.values(links);
+}
+
+function isRerouteKey(key) {
+  return typeof key === "string" && key[0] === "r";
+}
+
+function rerouteKey(id) {
+  return `r${id}`;
+}
+
+function rerouteIdOf(key) {
+  return Number(key.slice(1));
+}
+
+function memberExists(graph, key) {
+  return isRerouteKey(key) ? !!getReroute(graph, rerouteIdOf(key)) : !!getLink(graph, key);
 }
 
 function linkSig(link) {
@@ -103,9 +147,9 @@ function newTieColor(ties) {
 }
 
 /**
- * Drops link ids that no longer exist or now pass through reroutes, removes empty ties, rebuilds the index.
+ * Drops members that no longer exist, removes empty ties, rebuilds the index.
  * A wire reconnected between the same two slots gets a new link id; it keeps its place in the ribbon.
- * While a pointer is down, missing wires are kept, since a wire being dragged may be on its way back.
+ * While a pointer is down, missing members are kept, since a wire being dragged may be on its way back.
  */
 function syncTies(graph) {
   state.index.clear();
@@ -118,35 +162,36 @@ function syncTies(graph) {
   for (let i = ties.length - 1; i >= 0; i--) {
     const tie = ties[i];
     const kept = [];
-    for (const id of tie.links) {
-      const link = getLink(graph, id);
-      if (link) {
-        if (link.parentId == null) kept.push(id);
+    for (const key of tie.links) {
+      if (memberExists(graph, key)) {
+        kept.push(key);
         continue;
       }
-      const sig = state.sigs.get(id);
+      const sig = isRerouteKey(key) ? null : state.sigs.get(key);
       if (sig) {
         bySig ??= new Map(allLinks(graph).map((l) => [linkSig(l), l]));
         const twin = bySig.get(sig);
-        if (twin && twin.parentId == null && !tie.links.includes(twin.id) && !kept.includes(twin.id)) {
+        if (twin && !tie.links.includes(twin.id) && !kept.includes(twin.id)) {
           kept.push(twin.id);
           continue;
         }
       }
-      if (state.pointerDown) kept.push(id);
+      if (state.pointerDown) kept.push(key);
     }
     tie.links = kept;
     if (!kept.length) ties.splice(i, 1);
   }
   const sigs = new Map();
   for (const tie of ties) {
-    for (const id of tie.links) {
-      const link = getLink(graph, id);
-      const sig = link ? linkSig(link) : state.sigs.get(id);
-      if (sig) sigs.set(id, sig);
-      if (!link) continue;
-      let list = state.index.get(id);
-      if (!list) state.index.set(id, (list = []));
+    for (const key of tie.links) {
+      if (!isRerouteKey(key)) {
+        const link = getLink(graph, key);
+        const sig = link ? linkSig(link) : state.sigs.get(key);
+        if (sig) sigs.set(key, sig);
+      }
+      if (!memberExists(graph, key)) continue;
+      let list = state.index.get(key);
+      if (!list) state.index.set(key, (list = []));
       list.push(tie);
     }
   }
@@ -158,30 +203,52 @@ function endpointNode(graph, id) {
   return graph.getNodeById?.(id) ?? (id === -10 ? graph.inputNode : id === -20 ? graph.outputNode : null);
 }
 
-/** Moves a tie with its wires when every node on those wires moved by the same amount since the last frame. */
-function followNodes(graph, ties) {
-  if (state.nodePosFor !== ties) {
+/** The nodes and reroutes a member's segment runs between, as "n<id>" / "r<id>" anchor keys. */
+function anchorsOf(graph, key) {
+  if (isRerouteKey(key)) {
+    const reroute = getReroute(graph, rerouteIdOf(key));
+    if (!reroute) return [];
+    if (reroute.parentId != null) return [key, rerouteKey(reroute.parentId)];
+    const linkId = reroute.linkIds?.values?.().next().value;
+    const link = linkId != null ? getLink(graph, linkId) : null;
+    return link ? [key, `n${link.origin_id}`] : [key];
+  }
+  const link = getLink(graph, key);
+  if (!link) return [];
+  const start = link.parentId != null ? rerouteKey(link.parentId) : `n${link.origin_id}`;
+  return [start, `n${link.target_id}`];
+}
+
+function anchorId(anchor) {
+  const raw = anchor.slice(1);
+  const num = Number(raw);
+  return Number.isNaN(num) ? raw : num;
+}
+
+function anchorPosition(graph, anchor) {
+  const pos = anchor[0] === "r" ? getReroute(graph, anchorId(anchor))?.pos : endpointNode(graph, anchorId(anchor))?.pos;
+  return pos ? [pos[0], pos[1]] : null;
+}
+
+/** Moves a tie with its wires when every node and reroute on those wires moved by the same amount since the last frame. */
+function followAnchors(graph, ties) {
+  if (state.anchorPosFor !== ties) {
     // A loaded, undone or replaced tie list: positions from before are not comparable.
-    state.nodePosFor = ties;
-    state.nodePos.clear();
+    state.anchorPosFor = ties;
+    state.anchorPos.clear();
   }
   const current = new Map();
-  const posOf = (id) => {
-    if (!current.has(id)) {
-      const pos = endpointNode(graph, id)?.pos;
-      current.set(id, pos ? [pos[0], pos[1]] : null);
-    }
-    return current.get(id);
+  const posOf = (anchor) => {
+    if (!current.has(anchor)) current.set(anchor, anchorPosition(graph, anchor));
+    return current.get(anchor);
   };
   for (const tie of ties) {
     let delta = null;
     let follow = tie !== state.drag?.tie;
-    for (const id of tie.links) {
-      const link = getLink(graph, id);
-      if (!link) continue;
-      for (const nid of [link.origin_id, link.target_id]) {
-        const now = posOf(nid);
-        const before = state.nodePos.get(nid);
+    for (const key of tie.links) {
+      for (const anchor of anchorsOf(graph, key)) {
+        const now = posOf(anchor);
+        const before = state.anchorPos.get(anchor);
         if (!now || !before) {
           follow = false;
           continue;
@@ -193,7 +260,7 @@ function followNodes(graph, ties) {
     }
     if (follow && delta && (delta[0] || delta[1])) tie.pos = [tie.pos[0] + delta[0], tie.pos[1] + delta[1]];
   }
-  state.nodePos = current;
+  state.anchorPos = current;
 }
 
 function commit(canvas) {
@@ -220,16 +287,16 @@ function tieHalfLength(canvas, tie) {
   return ((tie.links.length - 1) * spacing(canvas)) / 2 + BAR_PAD;
 }
 
-function strandPoint(canvas, tie, linkId) {
-  const i = tie.links.indexOf(linkId);
+function strandPoint(canvas, tie, key) {
+  const i = tie.links.indexOf(key);
   const off = (i - (tie.links.length - 1) / 2) * spacing(canvas);
   const { n } = tieAxes(tie);
   return [tie.pos[0] + n[0] * off, tie.pos[1] + n[1] * off];
 }
 
-/** Ties on this link, ordered from output to input. */
-function orderedTies(linkId, a, b) {
-  const list = state.index.get(linkId);
+/** Ties on this segment, ordered from its start to its end. */
+function orderedTies(key, a, b) {
+  const list = state.index.get(key);
   if (!list?.length) return [];
   const dx = b[0] - a[0];
   const dy = b[1] - a[1];
@@ -238,19 +305,21 @@ function orderedTies(linkId, a, b) {
   );
 }
 
-/** Segments the link is drawn as, in renderLink terms. */
-function route(canvas, linkId, a, b, sd, ed) {
-  const ties = orderedTies(linkId, a, b);
-  if (!ties.length) return [{ a, b, sd, ed }];
-  const pts = ties.map((t) => ({ p: strandPoint(canvas, t, linkId), dir: tieAxes(t).t }));
+/** Sub-segments one rendered segment is drawn as, in renderLink terms. The outer ends keep their original controls. */
+function route(canvas, key, seg) {
+  const ties = orderedTies(key, seg.a, seg.b);
+  if (!ties.length) return [seg];
+  const pts = ties.map((t) => ({ p: strandPoint(canvas, t, key), dir: tieAxes(t).t }));
   const segs = [];
-  let prev = { p: a, dir: null };
-  for (const cur of [...pts, { p: b, dir: null }]) {
+  let prev = { p: seg.a, dir: null };
+  for (const cur of [...pts, { p: seg.b, dir: null }]) {
     const dist = Math.hypot(cur.p[0] - prev.p[0], cur.p[1] - prev.p[1]) * CONTROL_FACTOR;
-    const seg = { a: prev.p, b: cur.p, sd: prev.dir ? DIR.CENTER : sd, ed: cur.dir ? DIR.CENTER : ed };
-    if (prev.dir) seg.startControl = [prev.dir[0] * dist, prev.dir[1] * dist];
-    if (cur.dir) seg.endControl = [-cur.dir[0] * dist, -cur.dir[1] * dist];
-    segs.push(seg);
+    const sub = { a: prev.p, b: cur.p, sd: prev.dir ? DIR.CENTER : seg.sd, ed: cur.dir ? DIR.CENTER : seg.ed };
+    if (prev.dir) sub.startControl = [prev.dir[0] * dist, prev.dir[1] * dist];
+    else if (seg.startControl) sub.startControl = seg.startControl;
+    if (cur.dir) sub.endControl = [-cur.dir[0] * dist, -cur.dir[1] * dist];
+    else if (seg.endControl) sub.endControl = seg.endControl;
+    segs.push(sub);
     prev = cur;
   }
   return segs;
@@ -308,6 +377,7 @@ function tieBar(canvas, tie) {
 }
 
 function tieAt(canvas, graph, p) {
+  if (linksHidden(canvas)) return null;
   const pad = HIT_PAD_PX / canvas.ds.scale;
   const ties = tiesOf(graph);
   for (let i = ties.length - 1; i >= 0; i--) {
@@ -321,42 +391,44 @@ function tieAt(canvas, graph, p) {
   return null;
 }
 
-// ---------- cutting ----------
+// ---------- strokes ----------
 
-function applyCut(canvas, graph, p, q) {
-  if (Math.hypot(q[0] - p[0], q[1] - p[1]) < 4 / canvas.ds.scale) return;
+/** What a stroke from p to q would do: cut the ties it crosses, or else tie the wires it crosses. */
+function strokeTargets(canvas, graph, p, q) {
   const ties = tiesOf(graph);
-
-  // Cutting across an existing tie removes it.
   const cutTies = ties.filter((tie) => {
     const [r, s] = tieBar(canvas, tie);
     return intersect(p, q, r, s) !== null;
   });
-  if (cutTies.length) {
-    graph.extra[EXTRA_KEY] = ties.filter((t) => !cutTies.includes(t));
-    syncTies(graph);
-    commit(canvas);
-    return;
-  }
+  if (cutTies.length) return { cutTies, hits: [] };
 
-  // Otherwise tie every visible wire the line crosses.
   const hits = [];
-  for (const link of allLinks(graph)) {
-    if (link.parentId != null) continue;
-    const ep = state.endpoints.get(link.id);
-    if (!ep) continue;
+  for (const [key, ep] of state.endpoints) {
     let best = null;
-    for (const seg of route(canvas, link.id, ep.a, ep.b, ep.sd, ep.ed)) {
+    for (const seg of route(canvas, key, ep)) {
       const poly = segmentPolyline(canvas, seg);
       for (let i = 1; i < poly.length; i++) {
         const t = intersect(p, q, poly[i - 1], poly[i]);
         if (t === null || (best && t >= best.t)) continue;
         const dx = poly[i][0] - poly[i - 1][0], dy = poly[i][1] - poly[i - 1][1];
         const len = Math.hypot(dx, dy) || 1;
-        best = { t, link, tangent: [dx / len, dy / len] };
+        best = { t, key, tangent: [dx / len, dy / len] };
       }
     }
     if (best) hits.push(best);
+  }
+  return { cutTies, hits };
+}
+
+function applyStroke(canvas, graph, p, q) {
+  if (Math.hypot(q[0] - p[0], q[1] - p[1]) < 4 / canvas.ds.scale) return;
+  const { cutTies, hits } = strokeTargets(canvas, graph, p, q);
+
+  if (cutTies.length) {
+    graph.extra[EXTRA_KEY] = tiesOf(graph).filter((t) => !cutTies.includes(t));
+    syncTies(graph);
+    commit(canvas);
+    return;
   }
   if (!hits.length) return;
 
@@ -379,17 +451,40 @@ function applyCut(canvas, graph, p, q) {
 
   // Keep the ribbon straight between ties: if an existing tie holds every new wire,
   // reuse its strand order so the wires cross outside the bundle, not inside it.
-  const ids = hits.map((h) => h.link.id);
-  const twin = tiesOf(graph).find((t) => ids.every((id) => t.links.includes(id)));
-  if (twin) hits.sort((h1, h2) => twin.links.indexOf(h1.link.id) - twin.links.indexOf(h2.link.id));
+  const keys = hits.map((h) => h.key);
+  const twin = tiesOf(graph).find((t) => keys.every((k) => t.links.includes(k)));
+  if (twin) hits.sort((h1, h2) => twin.links.indexOf(h1.key) - twin.links.indexOf(h2.key));
 
   const all = tiesOf(graph, true);
-  const tie = { id: nextTieId(all), pos, angle, links: hits.map((h) => h.link.id) };
+  const tie = { id: nextTieId(all), pos, angle, links: hits.map((h) => h.key) };
   const color = newTieColor(all);
   if (color) tie.color = color;
   all.push(tie);
   syncTies(graph);
   commit(canvas);
+}
+
+function updatePreview(canvas) {
+  state.previewFrame = 0;
+  const cut = state.cut;
+  if (!cut?.last || !canvas.graph) return;
+  const { cutTies, hits } = strokeTargets(canvas, canvas.graph, cut.start, cut.last);
+  state.preview = { keys: new Set(hits.map((h) => h.key)), cutTies: new Set(cutTies) };
+  styleCutLine(cutTies.length ? "cut" : hits.length ? "tie" : "idle");
+  canvas.setDirty(true, true);
+}
+
+function schedulePreview(canvas) {
+  if (!state.previewFrame) state.previewFrame = requestAnimationFrame(() => updatePreview(canvas));
+}
+
+function endStroke(canvas) {
+  if (state.previewFrame) cancelAnimationFrame(state.previewFrame);
+  state.previewFrame = 0;
+  state.cut = null;
+  state.preview = null;
+  hideCutLine();
+  canvas.setDirty(true, true);
 }
 
 // ---------- tie menu ----------
@@ -453,7 +548,12 @@ function showTieMenu(canvas, graph, tie, event) {
   );
 }
 
-// ---------- overlay for the cut line ----------
+function setArmed(canvas, armed) {
+  state.armed = armed;
+  canvas.canvas.style.cursor = armed ? "crosshair" : "";
+}
+
+// ---------- overlay for the stroke line ----------
 
 function overlay() {
   if (state.overlay) return state.overlay;
@@ -461,13 +561,20 @@ function overlay() {
   const svg = document.createElementNS(svgNS, "svg");
   svg.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:9999;display:none";
   const line = document.createElementNS(svgNS, "line");
-  line.setAttribute("stroke", "#ff3b3b");
   line.setAttribute("stroke-width", "2");
   line.setAttribute("stroke-linecap", "round");
   svg.appendChild(line);
   document.body.appendChild(svg);
   state.overlay = { svg, line };
   return state.overlay;
+}
+
+/** "idle": crosses nothing yet, "tie": would tie wires, "cut": would remove a tie. */
+function styleCutLine(mode) {
+  const { line } = overlay();
+  line.setAttribute("stroke", mode === "cut" ? CUT_RED : mode === "tie" ? PREVIEW_WHITE : "rgba(255,255,255,0.5)");
+  if (mode === "idle") line.setAttribute("stroke-dasharray", "6 5");
+  else line.removeAttribute("stroke-dasharray");
 }
 
 function showCutLine(x1, y1, x2, y2) {
@@ -495,6 +602,10 @@ function isTyping(e) {
   return el instanceof HTMLElement && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
 }
 
+function hasModifier(e) {
+  return e.altKey || e.ctrlKey || e.metaKey || e.shiftKey;
+}
+
 function setHovered(canvas, id) {
   if (state.hovered === id) return;
   state.hovered = id;
@@ -509,13 +620,14 @@ function installInput(canvas) {
   const el = canvas.canvas;
 
   window.addEventListener("keydown", (e) => {
-    if (e.code === "KeyZ" && !e.ctrlKey && !e.metaKey && !e.altKey && !isTyping(e)) state.zHeld = true;
+    if (e.code === "Escape" && state.armed) setArmed(canvas, false);
+    if (e.code === tieKeyCode() && !hasModifier(e) && !isTyping(e)) state.keyHeld = true;
   }, true);
   window.addEventListener("keyup", (e) => {
-    if (e.code === "KeyZ") state.zHeld = false;
+    if (e.code === tieKeyCode()) state.keyHeld = false;
   }, true);
   window.addEventListener("blur", () => {
-    state.zHeld = false;
+    state.keyHeld = false;
     state.pointerDown = false;
   });
 
@@ -543,10 +655,15 @@ function installInput(canvas) {
     }
     if (e.button !== 0) return;
 
-    if (state.zHeld) {
+    // A held key only starts a stroke without modifiers, so Alt-drag cloning and similar keep working.
+    const stroke = state.armed || (state.keyHeld && !hasModifier(e));
+    if (stroke && !linksHidden(canvas)) {
       e.preventDefault();
       e.stopImmediatePropagation();
-      state.cut = { start: p, client: [e.clientX, e.clientY], pointerId: e.pointerId };
+      if (state.armed) setArmed(canvas, false);
+      state.cut = { start: p, client: [e.clientX, e.clientY], pointerId: e.pointerId, last: null };
+      state.preview = { keys: new Set(), cutTies: new Set() };
+      styleCutLine("idle");
       showCutLine(e.clientX, e.clientY, e.clientX, e.clientY);
       return;
     }
@@ -579,6 +696,8 @@ function installInput(canvas) {
     if (state.cut && e.pointerId === state.cut.pointerId) {
       e.stopImmediatePropagation();
       showCutLine(state.cut.client[0], state.cut.client[1], e.clientX, e.clientY);
+      state.cut.last = graphPoint(canvas, e);
+      schedulePreview(canvas);
       return;
     }
     if (state.drag && e.pointerId === state.drag.pointerId) {
@@ -600,9 +719,9 @@ function installInput(canvas) {
     if (e.target !== el || !canvas.graph || e.buttons) return;
     const tie = tieAt(canvas, canvas.graph, graphPoint(canvas, e));
     setHovered(canvas, tie?.id ?? null);
-    if (tie) {
+    if (tie || state.armed) {
       // Litegraph sets the cursor while handling the move; set ours afterwards.
-      requestAnimationFrame(() => (el.style.cursor = "grab"));
+      requestAnimationFrame(() => (el.style.cursor = tie ? "grab" : "crosshair"));
     }
   }, true);
 
@@ -610,10 +729,9 @@ function installInput(canvas) {
     state.pointerDown = false;
     if (state.cut && e.pointerId === state.cut.pointerId) {
       e.stopImmediatePropagation();
-      const cut = state.cut;
-      state.cut = null;
-      hideCutLine();
-      if (e.type === "pointerup" && canvas.graph) applyCut(canvas, canvas.graph, cut.start, graphPoint(canvas, e));
+      const start = state.cut.start;
+      endStroke(canvas);
+      if (e.type === "pointerup" && canvas.graph) applyStroke(canvas, canvas.graph, start, graphPoint(canvas, e));
       return;
     }
     if (state.drag && e.pointerId === state.drag.pointerId) {
@@ -629,14 +747,90 @@ function installInput(canvas) {
   window.addEventListener("pointercancel", end, true);
 }
 
+// ---------- copy and paste ----------
+
+function anchorOf(graph, key) {
+  const anchor = anchorsOf(graph, key).find((a) => a[0] === "n") ?? anchorsOf(graph, key)[0];
+  if (!anchor) return null;
+  const pos = anchorPosition(graph, anchor);
+  return pos ? { key: anchor, pos } : null;
+}
+
+/** Ties whose every member is in the copied items travel with them, under the clipboard's "zipTies" key. */
+function copiedTies(graph, items) {
+  const links = new Set((items.links ?? []).map((l) => l.id));
+  const reroutes = new Set((items.reroutes ?? []).map((r) => r.id));
+  const out = [];
+  for (const tie of tiesOf(graph)) {
+    const inside = tie.links.every((k) => (isRerouteKey(k) ? reroutes.has(rerouteIdOf(k)) : links.has(k)));
+    const anchor = inside ? anchorOf(graph, tie.links[0]) : null;
+    if (anchor) out.push({ pos: [...tie.pos], angle: tie.angle, color: tie.color, links: [...tie.links], anchor });
+  }
+  return out;
+}
+
+function pastedAnchorPos(result, anchor) {
+  const id = anchor.key.slice(1);
+  if (anchor.key[0] === "r") return result.reroutes?.get(Number(id))?.pos;
+  return (result.nodes?.get(Number(id)) ?? result.nodes?.get(id))?.pos;
+}
+
+function addPastedTies(graph, copied, result) {
+  const all = tiesOf(graph, true);
+  for (const tie of copied) {
+    const links = tie.links
+      .map((k) => (isRerouteKey(k) ? (result.reroutes?.get(rerouteIdOf(k)) ? rerouteKey(result.reroutes.get(rerouteIdOf(k)).id) : null) : result.links?.get(k)?.id))
+      .filter((k) => k != null);
+    const now = pastedAnchorPos(result, tie.anchor);
+    if (!links.length || !now) continue;
+    const pasted = { id: nextTieId(all), pos: [tie.pos[0] + now[0] - tie.anchor.pos[0], tie.pos[1] + now[1] - tie.anchor.pos[1]], angle: tie.angle, links };
+    if (tie.color) pasted.color = tie.color;
+    all.push(pasted);
+  }
+  syncTies(graph);
+}
+
+function installClipboard(canvas) {
+  const proto = Object.getPrototypeOf(canvas);
+  const origSerialize = proto._serializeItems;
+  const origDeserialize = proto._deserializeItems;
+  if (!origSerialize || !origDeserialize) return;
+
+  proto._serializeItems = function (...args) {
+    const items = origSerialize.apply(this, args);
+    if (this.graph && items) {
+      const ties = copiedTies(this.graph, items);
+      if (ties.length) items[CLIPBOARD_KEY] = ties;
+    }
+    return items;
+  };
+
+  proto._deserializeItems = function (clipboardItems, ...rest) {
+    const copied = clipboardItems?.[CLIPBOARD_KEY];
+    const graph = this.graph;
+    if (!Array.isArray(copied) || !copied.length || !graph) return origDeserialize.call(this, clipboardItems, ...rest);
+    // One change for the paste and its ties, so a single undo removes both.
+    graph.beforeChange?.();
+    this.emitBeforeChange?.();
+    try {
+      const result = origDeserialize.call(this, clipboardItems, ...rest);
+      if (result) addPastedTies(graph, copied, result);
+      return result;
+    } finally {
+      graph.afterChange?.();
+      this.emitAfterChange?.();
+    }
+  };
+}
+
 // ---------- rendering ----------
 
 function wireColor(tie) {
   const counts = new Map();
   let best = GREY;
   let max = 0;
-  for (const id of tie.links) {
-    const c = state.linkColors.get(id);
+  for (const key of tie.links) {
+    const c = state.linkColors.get(key);
     if (!c) continue;
     const n = (counts.get(c) ?? 0) + 1;
     counts.set(c, n);
@@ -658,14 +852,15 @@ function drawTies(canvas, ctx, graph) {
   if (!ties.length) return;
   ctx.save();
   for (const tie of ties) {
+    const cutting = state.preview?.cutTies.has(tie);
     const active = tie.id === state.hovered || state.drag?.tie === tie;
     const h = tieHalfLength(canvas, tie);
     ctx.save();
     ctx.translate(tie.pos[0], tie.pos[1]);
     ctx.rotate(tie.angle ?? 0);
     ctx.fillStyle = tieColor(tie);
-    ctx.strokeStyle = active ? "#ffffff" : "rgba(0,0,0,0.6)";
-    ctx.lineWidth = active ? 1.5 : 1;
+    ctx.strokeStyle = cutting ? CUT_RED : active ? "#ffffff" : "rgba(0,0,0,0.6)";
+    ctx.lineWidth = cutting ? 2 : active ? 1.5 : 1;
     // Strap across the wires, with the locking head at one end.
     ctx.beginPath();
     ctx.roundRect(-BAR_HALF_WIDTH, -h, BAR_HALF_WIDTH * 2, h * 2, BAR_HALF_WIDTH);
@@ -680,28 +875,49 @@ function drawTies(canvas, ctx, graph) {
   ctx.restore();
 }
 
+/** Member key of the segment renderLink is drawing, or null for segments ties never hold. */
+function segmentKey(link, opts) {
+  if (opts.reroute) return rerouteKey(opts.reroute.id);
+  if (opts.endControl) return null; // a reroute segment drawn without its reroute (link badge entry)
+  return link.id;
+}
+
+function tieVisible(canvas, tie) {
+  const area = canvas.visible_area;
+  if (!area) return true;
+  const m = 40 / canvas.ds.scale;
+  return tie.pos[0] >= area[0] - m && tie.pos[0] <= area[0] + area[2] + m && tie.pos[1] >= area[1] - m && tie.pos[1] <= area[1] + area[3] + m;
+}
+
 function installRendering(canvas) {
   const proto = Object.getPrototypeOf(canvas);
   const origRenderLink = proto.renderLink;
   const origDrawConnections = proto.drawConnections;
+  const origRenderAllSegments = proto._renderAllLinkSegments;
 
   proto.renderLink = function (ctx, a, b, link, skipBorder, flow, color, sd, ed, opts = {}) {
-    if (state.rendering || !link || link.parentId != null || opts.reroute || opts.startControl || opts.endControl || this.graph !== canvas.graph) {
-      return origRenderLink.apply(this, arguments);
+    if (state.rendering || !link || this.graph !== canvas.graph) return origRenderLink.apply(this, arguments);
+    state.rendered = true;
+    const key = segmentKey(link, opts);
+    if (key == null) return origRenderLink.apply(this, arguments);
+    const seg = { a: [a[0], a[1]], b: [b[0], b[1]], sd, ed, startControl: opts.startControl, endControl: opts.endControl };
+    state.endpoints.set(key, seg);
+    const previewed = state.preview?.keys.has(key);
+    const ties = state.index.get(key);
+    if (!ties?.length) {
+      if (!previewed) return origRenderLink.apply(this, arguments);
+      return origRenderLink.call(this, ctx, a, b, link, skipBorder, flow, PREVIEW_WHITE, sd, ed, opts);
     }
-    state.endpoints.set(link.id, { a: [a[0], a[1]], b: [b[0], b[1]], sd, ed });
-    const ties = state.index.get(link.id);
-    if (!ties?.length) return origRenderLink.apply(this, arguments);
-    state.linkColors.set(link.id, color || link.color || this.constructor.link_type_colors?.[link.type] || this.default_link_color);
+    state.linkColors.set(key, color || link.color || this.constructor.link_type_colors?.[link.type] || this.default_link_color);
 
-    const active = ties.some((t) => t.id === state.hovered || state.drag?.tie === t);
-    const segColor = color ?? (active ? "#ffffff" : null);
-    const segs = route(this, link.id, a, b, sd, ed);
+    const active = previewed || ties.some((t) => t.id === state.hovered || state.drag?.tie === t);
+    const segColor = color ?? (active ? PREVIEW_WHITE : null);
+    const segs = route(this, key, seg);
     const marker = this.linkMarkerShape;
     state.rendering = true;
     try {
-      // Draw every segment after the first without a centre marker, then the first one
-      // last so the link's hit path and centre marker belong to the output-side segment.
+      // Draw every sub-segment after the first without a centre marker, then the first one
+      // last so the link's hit path and centre marker belong to the output-side piece.
       this.linkMarkerShape = MARKER_NONE;
       for (let i = 1; i < segs.length; i++) {
         const s = segs[i];
@@ -716,15 +932,29 @@ function installRendering(canvas) {
     }
   };
 
+  if (origRenderAllSegments) {
+    // Litegraph skips a link whose ends are both off screen, which would hide a ribbon dragged into view.
+    proto._renderAllLinkSegments = function (ctx, link, startPos, endPos, visibleReroutes, renderedSegments, now, startDir, endDir, ...rest) {
+      state.rendered = false;
+      const r = origRenderAllSegments.apply(this, arguments);
+      if (state.rendered || this !== canvas || !link || link.parentId != null || link._dragging) return r;
+      const ties = state.index.get(link.id);
+      if (ties?.some((t) => tieVisible(this, t))) {
+        this.renderLink(ctx, startPos, endPos, link, false, 0, null, startDir || DIR.RIGHT, endDir || DIR.LEFT);
+      }
+      return r;
+    };
+  }
+
   proto.drawConnections = function (ctx, ...rest) {
     const graph = this.graph;
     if (this !== canvas || !graph) return origDrawConnections.call(this, ctx, ...rest);
     state.endpoints.clear();
     state.linkColors.clear();
     syncTies(graph);
-    followNodes(graph, tiesOf(graph));
+    followAnchors(graph, tiesOf(graph));
     const r = origDrawConnections.call(this, ctx, ...rest);
-    drawTies(this, ctx, graph);
+    if (!linksHidden(this)) drawTies(this, ctx, graph);
     return r;
   };
 }
@@ -741,10 +971,31 @@ app.registerExtension({
       options: Object.values(COLOR_MODE),
       defaultValue: COLOR_MODE.RANDOM,
     },
+    {
+      id: KEY_SETTING,
+      category: ["Zip Ties", "Ties", "Key"],
+      name: "Key to hold while dragging across wires",
+      tooltip: "Hold this key and drag a line across wires to tie them, or across a tie to remove it. Only keys ComfyUI does not use on their own are offered.",
+      type: "combo",
+      options: KEYS,
+      defaultValue: "Z",
+    },
   ],
+  getCanvasMenuItems() {
+    const canvas = app.canvas;
+    if (!canvas || linksHidden(canvas)) return [];
+    return [
+      null,
+      {
+        content: "Tie wires",
+        callback: () => setArmed(canvas, true),
+      },
+    ];
+  },
   async setup() {
     const canvas = app.canvas;
     installRendering(canvas);
+    installClipboard(canvas);
     installInput(canvas);
   },
 });
