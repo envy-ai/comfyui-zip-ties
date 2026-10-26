@@ -2,9 +2,9 @@
 
 A frontend extension that bundles wires into a ribbon with small zip ties. The idea comes from a [prototype by @cmzw_](https://x.com/cmzw_/status/2114315567977107653).
 
-![Demo: two Z-drag cuts bundle seven wires, then the ties are dragged around](preview.gif)
+![Demo: Z-drag cuts tie the wires into a ribbon, the tie menu recolours the ties, and dragging the ties bends the ribbon](preview.gif)
 
-The full recording with the cut and removal gestures is [zip-ties-demo.mp4](zip-ties-demo.mp4).
+The full recording is [zip-ties-demo.mp4](zip-ties-demo.mp4).
 
 ## Use
 
