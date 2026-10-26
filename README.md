@@ -13,6 +13,9 @@ The full recording is [zip-ties-demo.mp4](zip-ties-demo.mp4).
 | Tie wires together | Hold `Z` and drag a line across the wires |
 | Tie wires without a keyboard | Right-click the empty canvas, choose **Tie wires**, then drag a line across the wires |
 | Move a tie | Drag the tie |
+| Select several ties | Ctrl/Cmd-click each tie, Shift-click to add one, or drag a selection box across them together with nodes |
+| Move selected ties | Drag one of them, or drag a selected node and they come along |
+| Delete selected ties | Press Delete or Backspace |
 | Rotate a tie | Shift-drag the tie. It snaps to 15° steps; hold Alt as well to rotate freely |
 | Change colour, rotate 90° or 45°, remove | Right-click the tie |
 | Remove a tie | Hold `Z` and drag a line across the tie, or double-click it |
@@ -25,7 +28,7 @@ The wires keep their colours and run side by side between ties. Hovering or drag
 
 Wires that pass through reroutes can be tied too. A tie holds the piece of wire it was drawn across: the piece between two reroutes, between an output and a reroute, or between the last reroute and the input. A piece that ends at a reroute is shared by every wire through that reroute.
 
-A tie moves along when you move every node and reroute its wires connect, for example a selection or a whole group. Moving only some of them leaves the tie where it is, the same as a reroute. A wire that is disconnected and connected again between the same two slots stays in its ties. A deleted wire, or one connected to a different slot, leaves its ties, and a tie with no wires left disappears.
+A tie moves along when you move every node and reroute its wires connect, for example a whole selection. Moving only some of them leaves the tie where it is, the same as a reroute. A tie inside a group moves with the group when you drag the group; Ctrl/Cmd-dragging a group moves only its frame, and the ties stay put like the nodes do. Selected ties move with the selected nodes, and Delete removes selected nodes and ties in one step that one undo brings back. A wire that is disconnected and connected again between the same two slots stays in its ties. A deleted wire, or one connected to a different slot, leaves its ties, and a tie with no wires left disappears.
 
 Copying and pasting nodes brings their ties along when every wire in a tie is part of the copy. One undo removes the pasted nodes and their ties together.
 
@@ -54,7 +57,8 @@ The extension is one file, `web/zip_ties.js`. It wraps these litegraph methods o
 
 - `renderLink`: records where each wire piece starts and ends, and when a piece belongs to a tie it redraws it as several segments that pass through the tie, each strand offset sideways from the tie centre. Segment drawing is delegated to ComfyUI's own link renderer, so colours, borders and highlight behaviour come along for free.
 - `_renderAllLinkSegments`: litegraph skips a wire when both its ends are off screen, so the extension draws a tied wire anyway when one of its ties is on screen.
-- `drawConnections`: prunes ties whose wires are gone, moves ties whose nodes and reroutes all moved together, then draws the ties on top of the wires.
+- `drawConnections`: prunes ties whose wires are gone and moves ties that should follow a moved group, the dragged selection, or nodes and reroutes that all moved together, then draws the ties on top of the wires.
+- `deselectAll`, `handleLiveSelect`, `_handleMultiSelect` and `deleteSelected`: ties take part in clearing, box-selecting and deleting the canvas selection.
 - `_serializeItems` and `_deserializeItems`: copy adds the ties to the clipboard data, and paste maps them onto the new wires inside the same undo step.
 
 The drag gesture runs in capture-phase listeners on `window`, so it sees pointer events before litegraph and can claim them when the key is held or a tie is hit. The line is tested against each wire's bezier curve. When a new tie's wires all already belong to another tie, it copies that tie's strand order so wires never cross inside the bundle.

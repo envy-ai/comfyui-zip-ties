@@ -64,6 +64,10 @@ const state = {
   anchorPos: new Map(), // anchor key -> [x, y] last frame, for nodes and reroutes on tied wires
   anchorPosFor: null, // the ties array anchorPos was recorded against
   overlay: null,
+  selected: new Set(), // selected ties
+  liveSelectBase: null, // tie selection when a live rubber-band selection started
+  groupBox: new Map(), // group -> { pos, size } last frame
+  selectionPos: new Map(), // selected canvas item -> [x, y] last frame
 };
 
 function setting(id, fallback) {
@@ -243,8 +247,69 @@ function anchorPosition(graph, anchor) {
   return pos ? [pos[0], pos[1]] : null;
 }
 
+function shiftTie(tie, d) {
+  tie.pos = [tie.pos[0] + d[0], tie.pos[1] + d[1]];
+}
+
+function insideBox(p, box) {
+  return p[0] >= box.pos[0] && p[0] <= box.pos[0] + box.size[0] && p[1] >= box.pos[1] && p[1] <= box.pos[1] + box.size[1];
+}
+
+/**
+ * Moves the ties inside a group by as much as the group moved since the last frame. A group that
+ * changed size was resized or refitted rather than moved, and a Ctrl/Cmd-drag moves only the frame.
+ */
+function followGroups(canvas, graph, ties, moved) {
+  const mods = canvas._lastDragModifiers;
+  const frameOnly = canvas.isDragging && (mods?.ctrlKey || mods?.metaKey);
+  const current = new Map();
+  for (const group of graph._groups ?? graph.groups ?? []) {
+    if (!group?.pos || !group.size) continue;
+    const box = { pos: [group.pos[0], group.pos[1]], size: [group.size[0], group.size[1]] };
+    current.set(group, box);
+    const before = state.groupBox.get(group);
+    if (!before || frameOnly) continue;
+    const d = [box.pos[0] - before.pos[0], box.pos[1] - before.pos[1]];
+    if (!d[0] && !d[1]) continue;
+    if (box.size[0] !== before.size[0] || box.size[1] !== before.size[1]) continue;
+    for (const tie of ties) {
+      if (moved.has(tie) || tie === state.drag?.tie || !insideBox(tie.pos, before)) continue;
+      shiftTie(tie, d);
+      moved.add(tie);
+    }
+  }
+  state.groupBox = current;
+}
+
+/** Moves selected ties along when every selected canvas item moved by the same amount since the last frame. */
+function followSelection(canvas, moved) {
+  const current = new Map();
+  let delta = null;
+  let same = true;
+  for (const item of canvas.selectedItems ?? []) {
+    if (!item?.pos) continue;
+    const now = [item.pos[0], item.pos[1]];
+    current.set(item, now);
+    const before = state.selectionPos.get(item);
+    if (!before) {
+      same = false;
+      continue;
+    }
+    const d = [now[0] - before[0], now[1] - before[1]];
+    if (!delta) delta = d;
+    else if (Math.abs(d[0] - delta[0]) > 0.01 || Math.abs(d[1] - delta[1]) > 0.01) same = false;
+  }
+  state.selectionPos = current;
+  if (!state.selected.size || !same || !delta || (!delta[0] && !delta[1])) return;
+  for (const tie of state.selected) {
+    if (moved.has(tie) || tie === state.drag?.tie) continue;
+    shiftTie(tie, delta);
+    moved.add(tie);
+  }
+}
+
 /** Moves a tie with its wires when every node and reroute on those wires moved by the same amount since the last frame. */
-function followAnchors(graph, ties) {
+function followAnchors(graph, ties, moved) {
   if (state.anchorPosFor !== ties) {
     // A loaded, undone or replaced tie list: positions from before are not comparable.
     state.anchorPosFor = ties;
@@ -257,7 +322,7 @@ function followAnchors(graph, ties) {
   };
   for (const tie of ties) {
     let delta = null;
-    let follow = tie !== state.drag?.tie;
+    let follow = tie !== state.drag?.tie && !moved.has(tie);
     for (const key of tie.links) {
       for (const anchor of anchorsOf(graph, key)) {
         const now = posOf(anchor);
@@ -271,9 +336,98 @@ function followAnchors(graph, ties) {
         else if (Math.abs(d[0] - delta[0]) > 0.01 || Math.abs(d[1] - delta[1]) > 0.01) follow = false;
       }
     }
-    if (follow && delta && (delta[0] || delta[1])) tie.pos = [tie.pos[0] + delta[0], tie.pos[1] + delta[1]];
+    if (follow && delta && (delta[0] || delta[1])) shiftTie(tie, delta);
   }
   state.anchorPos = current;
+}
+
+/** Runs once per frame: ties follow moved groups, the dragged selection, then their wires' ends. */
+function followMoves(canvas, graph) {
+  const ties = tiesOf(graph);
+  for (const tie of state.selected) if (!ties.includes(tie)) state.selected.delete(tie);
+  const moved = new Set();
+  followGroups(canvas, graph, ties, moved);
+  followSelection(canvas, moved);
+  followAnchors(graph, ties, moved);
+}
+
+// ---------- selection ----------
+
+function normalizedRect(rect) {
+  const x = rect[2] < 0 ? rect[0] + rect[2] : rect[0];
+  const y = rect[3] < 0 ? rect[1] + rect[3] : rect[1];
+  return { pos: [x, y], size: [Math.abs(rect[2]), Math.abs(rect[3])] };
+}
+
+/** Applies a rubber-band selection to ties with litegraph's modifiers: Shift adds, Alt removes, otherwise replace. */
+function selectTiesInRect(canvas, e, rect, base) {
+  const box = normalizedRect(rect);
+  const inRect = tiesOf(canvas.graph).filter((t) => tieShown(t) && insideBox(t.pos, box));
+  let next;
+  if (e?.shiftKey && !e.altKey) next = new Set([...base, ...inRect]);
+  else if (e?.altKey && !e.shiftKey) next = new Set([...base].filter((t) => !inRect.includes(t)));
+  else next = new Set(inRect);
+  state.selected = next;
+  canvas.setDirty(true, true);
+}
+
+function removeTies(canvas, graph, ties) {
+  graph.extra[EXTRA_KEY] = tiesOf(graph).filter((t) => !ties.has(t));
+  state.selected.clear();
+  state.hovered = null;
+  syncTies(graph);
+}
+
+function installSelection(canvas) {
+  const proto = Object.getPrototypeOf(canvas);
+
+  const origDeselectAll = proto.deselectAll;
+  if (origDeselectAll) {
+    proto.deselectAll = function (...args) {
+      if (this === canvas) state.selected.clear();
+      return origDeselectAll.apply(this, args);
+    };
+  }
+
+  const origLive = proto.handleLiveSelect;
+  if (origLive) {
+    proto.handleLiveSelect = function (e, dragRect, ...rest) {
+      const r = origLive.call(this, e, dragRect, ...rest);
+      if (this === canvas && this.graph) {
+        state.liveSelectBase ??= new Set(state.selected);
+        selectTiesInRect(this, e, dragRect, state.liveSelectBase);
+      }
+      return r;
+    };
+  }
+
+  const origMulti = proto._handleMultiSelect;
+  if (origMulti) {
+    proto._handleMultiSelect = function (e, dragRect, ...rest) {
+      const base = new Set(state.selected);
+      const r = origMulti.call(this, e, dragRect, ...rest);
+      if (this === canvas && this.graph) selectTiesInRect(this, e, dragRect, base);
+      return r;
+    };
+  }
+
+  const origDelete = proto.deleteSelected;
+  if (origDelete) {
+    // One change for the selected ties and the selected nodes, so a single undo restores both.
+    proto.deleteSelected = function (...args) {
+      const graph = this.graph;
+      if (this !== canvas || !graph || !state.selected.size) return origDelete.apply(this, args);
+      graph.beforeChange?.();
+      this.emitBeforeChange?.();
+      try {
+        removeTies(this, graph, new Set(state.selected));
+        return origDelete.apply(this, args);
+      } finally {
+        graph.afterChange?.();
+        this.emitAfterChange?.();
+      }
+    };
+  }
 }
 
 function commit(canvas) {
@@ -637,6 +791,14 @@ function installInput(canvas) {
   window.addEventListener("keydown", (e) => {
     if (e.code === "Escape" && state.armed) setArmed(canvas, false);
     if (e.code === tieKeyCode() && !hasModifier(e) && !isTyping(e)) state.keyHeld = true;
+    // With only ties selected ComfyUI has nothing to delete, so the extension handles the key itself.
+    const deleting = e.key === "Delete" || e.key === "Backspace";
+    if (deleting && state.selected.size && !isTyping(e) && canvas.graph && !canvas.selectedItems?.size) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      removeTies(canvas, canvas.graph, new Set(state.selected));
+      commit(canvas);
+    }
   }, true);
   window.addEventListener("keyup", (e) => {
     if (e.code === tieKeyCode()) state.keyHeld = false;
@@ -691,14 +853,26 @@ function installInput(canvas) {
     const now = performance.now();
     if (state.lastDown.id === tie.id && now - state.lastDown.time < DOUBLE_CLICK_MS) {
       state.lastDown = { id: null, time: 0 };
+      state.selected.delete(tie);
       removeTie(canvas, graph, tie);
       return;
     }
     state.lastDown = { id: tie.id, time: now };
+
+    // Ctrl/Cmd-click toggles a tie in the selection. Shift-click adds it; Shift-drag still rotates.
+    if (e.ctrlKey || e.metaKey) {
+      if (state.selected.has(tie)) state.selected.delete(tie);
+      else state.selected.add(tie);
+      canvas.setDirty(true, true);
+      return;
+    }
+    if (!e.shiftKey && !state.selected.has(tie)) {
+      canvas.deselectAll();
+      state.selected.add(tie);
+    }
     state.drag = {
       tie,
-      dx: tie.pos[0] - p[0],
-      dy: tie.pos[1] - p[1],
+      last: p,
       pointerId: e.pointerId,
       moved: false,
       rotate: e.shiftKey,
@@ -725,7 +899,11 @@ function installInput(canvas) {
         if (!e.altKey) angle = Math.round(angle / SNAP) * SNAP;
         drag.tie.angle = angle;
       } else {
-        drag.tie.pos = [p[0] + drag.dx, p[1] + drag.dy];
+        // Dragging a selected tie moves every selected tie.
+        const d = [p[0] - drag.last[0], p[1] - drag.last[1]];
+        const group = state.selected.has(drag.tie) ? state.selected : new Set([drag.tie]);
+        for (const tie of group) shiftTie(tie, d);
+        drag.last = p;
       }
       drag.moved = true;
       canvas.setDirty(true, true);
@@ -742,6 +920,7 @@ function installInput(canvas) {
 
   const end = (e) => {
     state.pointerDown = false;
+    state.liveSelectBase = null;
     if (state.cut && e.pointerId === state.cut.pointerId) {
       e.stopImmediatePropagation();
       const start = state.cut.start;
@@ -751,9 +930,15 @@ function installInput(canvas) {
     }
     if (state.drag && e.pointerId === state.drag.pointerId) {
       e.stopImmediatePropagation();
-      const moved = state.drag.moved;
+      const { moved, rotate, tie } = state.drag;
       state.drag = null;
       el.style.cursor = "";
+      if (rotate && !moved) state.selected.add(tie);
+      else if (!moved && state.selected.size > 1) {
+        // A plain click on one of several selected ties selects just that tie.
+        canvas.deselectAll();
+        state.selected.add(tie);
+      }
       if (moved) commit(canvas);
       else canvas.setDirty(true, true);
     }
@@ -870,13 +1055,14 @@ function drawTies(canvas, ctx, graph) {
     if (!tieShown(tie)) continue;
     const cutting = state.preview?.cutTies.has(tie);
     const active = tie.id === state.hovered || state.drag?.tie === tie;
+    const selected = state.selected.has(tie);
     const h = tieHalfLength(canvas, tie);
     ctx.save();
     ctx.translate(tie.pos[0], tie.pos[1]);
     ctx.rotate(tie.angle ?? 0);
     ctx.fillStyle = tieColor(tie);
-    ctx.strokeStyle = cutting ? CUT_RED : active ? "#ffffff" : "rgba(0,0,0,0.6)";
-    ctx.lineWidth = cutting ? 2 : active ? 1.5 : 1;
+    ctx.strokeStyle = cutting ? CUT_RED : selected || active ? "#ffffff" : "rgba(0,0,0,0.6)";
+    ctx.lineWidth = cutting || selected ? 2 : active ? 1.5 : 1;
     // Strap across the wires, with the locking head at one end.
     ctx.beginPath();
     ctx.roundRect(-BAR_HALF_WIDTH, -h, BAR_HALF_WIDTH * 2, h * 2, BAR_HALF_WIDTH);
@@ -968,7 +1154,7 @@ function installRendering(canvas) {
     state.endpoints.clear();
     state.linkColors.clear();
     syncTies(graph);
-    followAnchors(graph, tiesOf(graph));
+    followMoves(this, graph);
     const r = origDrawConnections.call(this, ctx, ...rest);
     if (!linksHidden(this)) drawTies(this, ctx, graph);
     return r;
@@ -1013,5 +1199,6 @@ app.registerExtension({
     installRendering(canvas);
     installClipboard(canvas);
     installInput(canvas);
+    installSelection(canvas);
   },
 });
