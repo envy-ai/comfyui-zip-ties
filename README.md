@@ -26,7 +26,8 @@ Each new tie gets a random cable-tie colour. The setting **Zip Ties → Colour o
 
 The wires keep their colours and run side by side between ties. Hovering or dragging a tie highlights every wire in it. A wire can pass through several ties. Rotating a tie turns the direction the wires take through it, so two ties at 0° and 90° make a right-angle bend.
 
-**Zip Ties → Wire routing** can draw both tied and untied wires as horizontal and vertical runs with rounded 90° corners. Free trunk positions follow the canvas grid; wire ends and tie strands stay at their exact positions. The default keeps ComfyUI's usual link shape. In **Rounded grid** mode, ties appear at the nearest 90° angle; switching back restores their saved angles.
+**Zip Ties → Wire routing** can draw both tied and untied wires as horizontal and vertical runs with rounded 90° corners. Bundled wires take nested bends, with a wider curve on the outside. Free trunk positions follow the canvas grid; wire ends and tie strands stay at their exact positions. The default keeps ComfyUI's usual link shape. In **Rounded grid** mode, ties appear at the nearest 90° angle; switching back restores their saved angles.
+When a wire returns toward a node on its left, the return run goes above or below its connected nodes, choosing the side toward the input when possible.
 
 Wires that pass through reroutes can be tied too. A tie holds the piece of wire it was drawn across: the piece between two reroutes, between an output and a reroute, or between the last reroute and the input. A piece that ends at a reroute is shared by every wire through that reroute.
 
