@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-zip-ties"
 description = "Bundle ComfyUI wires into ribbons with colour-coded zip ties. Hold Z and drag across wires to tie them."
-version = "0.3.0"
+version = "0.3.1"
 license = { file = "LICENSE" }
 dependencies = []
 
