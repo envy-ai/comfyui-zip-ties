@@ -29,7 +29,7 @@ A tie moves along when you move every node and reroute its wires connect, for ex
 
 Copying and pasting nodes brings their ties along when every wire in a tie is part of the copy. One undo removes the pasted nodes and their ties together.
 
-Ties are stored in the workflow's `extra.zipTies`, so they save, load and undo with the rest of the graph. Workflows opened without the extension still load; the wires draw normally. Ties are hidden and cannot be clicked when links are hidden.
+Ties are stored in the workflow's `extra.zipTies`, so they save, load and undo with the rest of the graph. Workflows opened without the extension still load; the wires draw normally. A malformed `zipTies` entry is dropped when the workflow loads. A tie is hidden, and cannot be clicked, while none of its wires are drawn: when links are hidden for the whole canvas, or when every wire in the tie was hidden with **Hide Link**. It comes back when one of its wires is shown again.
 
 ## Install
 

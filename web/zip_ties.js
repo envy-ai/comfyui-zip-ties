@@ -126,6 +126,15 @@ function memberExists(graph, key) {
   return isRerouteKey(key) ? !!getReroute(graph, rerouteIdOf(key)) : !!getLink(graph, key);
 }
 
+function validTie(tie) {
+  return !!tie && Array.isArray(tie.links) && Array.isArray(tie.pos) && Number.isFinite(tie.pos[0]) && Number.isFinite(tie.pos[1]);
+}
+
+/** A tie shows, and can be clicked, while at least one of its wires was drawn in the last frame. */
+function tieShown(tie) {
+  return tie.links.some((key) => state.endpoints.has(key));
+}
+
 function linkSig(link) {
   return `${link.origin_id}:${link.origin_slot}>${link.target_id}:${link.target_slot}`;
 }
@@ -154,8 +163,11 @@ function newTieColor(ties) {
 function syncTies(graph) {
   state.index.clear();
   const ties = tiesOf(graph);
+  // Workflows come from anywhere; a malformed entry is dropped rather than breaking every frame.
+  for (let i = ties.length - 1; i >= 0; i--) if (!validTie(ties[i])) ties.splice(i, 1);
   if (!ties.length) {
     state.sigs.clear();
+    if (graph?.extra) delete graph.extra[EXTRA_KEY];
     return;
   }
   let bySig = null;
@@ -163,6 +175,7 @@ function syncTies(graph) {
     const tie = ties[i];
     const kept = [];
     for (const key of tie.links) {
+      if (kept.includes(key)) continue;
       if (memberExists(graph, key)) {
         kept.push(key);
         continue;
@@ -382,6 +395,7 @@ function tieAt(canvas, graph, p) {
   const ties = tiesOf(graph);
   for (let i = ties.length - 1; i >= 0; i--) {
     const tie = ties[i];
+    if (!tieShown(tie)) continue;
     const { t, n } = tieAxes(tie);
     const dx = p[0] - tie.pos[0], dy = p[1] - tie.pos[1];
     const along = dx * t[0] + dy * t[1];
@@ -397,6 +411,7 @@ function tieAt(canvas, graph, p) {
 function strokeTargets(canvas, graph, p, q) {
   const ties = tiesOf(graph);
   const cutTies = ties.filter((tie) => {
+    if (!tieShown(tie)) return false;
     const [r, s] = tieBar(canvas, tie);
     return intersect(p, q, r, s) !== null;
   });
@@ -852,6 +867,7 @@ function drawTies(canvas, ctx, graph) {
   if (!ties.length) return;
   ctx.save();
   for (const tie of ties) {
+    if (!tieShown(tie)) continue;
     const cutting = state.preview?.cutTies.has(tie);
     const active = tie.id === state.hovered || state.drag?.tie === tie;
     const h = tieHalfLength(canvas, tie);
